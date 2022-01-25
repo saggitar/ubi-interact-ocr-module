@@ -1,0 +1,16 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "setuptools_scm>=6.2",
+    "wheel",
+]
+
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "default",
+]
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
