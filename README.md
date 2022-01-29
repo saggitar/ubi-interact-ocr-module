@@ -11,4 +11,4 @@ Tesseract OCR for Ubi Interact
    
 ## Known Issues
 * The processing modules which use opencv seem to sometimes randomly crash under Windows
-* Processing Frequency depends on the module implementation. Typically ``TesseractOCR_EAST`` allows for a slightly higher processing frequency, OO
+* Processing Frequency depends on the module implementation. Typically ``TesseractOCR_EAST`` allows for a slightly higher processing frequency and is run at __10fps__ while the ``TesseractOCR_PURE`` module is run at __5fps__.
