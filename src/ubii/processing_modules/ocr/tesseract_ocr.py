@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import numpy as np
 import os
 from functools import wraps, partial
+
+import numpy as np
 
 try:
     import importlib.resources as importlib_resources
 except ImportError:
-    # Try backported to PY<37 `importlib_resources`.
+    # Try backported to PY<=37 `importlib_resources`.
     import importlib_resources
 
 try:
@@ -15,11 +16,9 @@ try:
 except ImportError:
     from backports.cached_property import cached_property
 
-import asyncio
-import concurrent.futures
 import logging
 from tesserocr import PyTessBaseAPI, RIL, OEM, PSM
-import cv2
+import cv2.cv2 as cv2  # pycharm is stupid
 
 import ubii.proto as ub
 from ubii.interact.processing import ProcessingRoutine
@@ -101,10 +100,6 @@ class BaseModule(ProcessingRoutine):
 
         self._image = None
         self._api = PyTessBaseAPI(**(api_args or {}))
-        self._executor_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=4,
-        )
-        self._loop: asyncio.AbstractEventLoop | None = None
 
     def read_image(self, image: ub.Image2D, conversion=bgr_conversions.get):
         data = np.frombuffer(
@@ -130,16 +125,12 @@ class BaseModule(ProcessingRoutine):
     def image(self):
         return self._image
 
-    def run_soon(self, callback, *args):
-        assert self._loop is not None
-        self._loop.run_in_executor(self._executor_pool, callback, *args)
-
     def on_created(self, context):
         super().on_created(context)
         self._loop = context.loop
 
     def log_performace(self, context):
-        self.run_soon(log.info, f"Performance: {context.scheduler.performance_rating:.2%}")
+        log.info(f"Performance: {context.scheduler.performance_rating:.2%}")
 
     def ocr_in_box(self, box, min_confidence=70):
         self.api.SetRectangle(*box)
@@ -185,7 +176,7 @@ class BaseModule(ProcessingRoutine):
         return x1, y1, x2 - x1, y2 - y1
 
 
-class TesseractOCR_pure(BaseModule):
+class TesseractOCR_PURE(BaseModule):
     def on_processing(self, context):
         super().on_processing(context)
         results = []
