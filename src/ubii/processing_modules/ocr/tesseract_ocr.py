@@ -204,6 +204,7 @@ class TesseractOCR_MSER(BaseModule):
             eval_strings,
             api_args={'oem': OEM.DEFAULT, 'psm': PSM.SINGLE_CHAR},
             **kwargs)
+        self.processing_mode.frequency = 10
         self._mser = cv2.MSER_create(max_variation=0.25)
 
     @RunEachFrame(num_frames=30, callback=BaseModule.log_performace)
