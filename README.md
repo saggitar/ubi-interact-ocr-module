@@ -1,4 +1,4 @@
-# ubii-interact-ocr-module
+# ubii-processing-module-ocr
 Tesseract OCR for Ubi Interact
 
 ## Requirements
