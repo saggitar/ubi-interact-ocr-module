@@ -21,7 +21,7 @@ from tesserocr import PyTessBaseAPI, RIL, OEM, PSM
 import cv2.cv2 as cv2  # pycharm is stupid
 
 import ubii.proto as ub
-from ubii.interact.processing import ProcessingRoutine
+from ubii.framework.processing import ProcessingRoutine
 
 try:
     from PIL import Image
@@ -50,7 +50,7 @@ bgr_conversions = {
 }
 
 
-class RunEachFrame:
+class RunOnFrame:
     def __init__(self, num_frames, callback):
         self.processing_count = 0
         self.num_frames = num_frames
@@ -74,7 +74,6 @@ class BaseModule(ProcessingRoutine):
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
         super().__init__(mapping, eval_strings, **kwargs)
         constants = context.constants
-        self.name = 'coco-ssd-object-detection'
         self.tags = ['ocr', 'text-detection', 'tesseract']
         self.description = 'Trying some OCR Stuff'
 
@@ -177,6 +176,12 @@ class BaseModule(ProcessingRoutine):
 
 
 class TesseractOCR_PURE(BaseModule):
+
+
+    def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
+        super().__init__(context, mapping, eval_strings, api_args, **kwargs)
+        self.name = 'tesseract-ocr-pure'
+
     def on_processing(self, context):
         super().on_processing(context)
         results = []
@@ -198,16 +203,18 @@ class TesseractOCR_PURE(BaseModule):
 
 class TesseractOCR_MSER(BaseModule):
 
-    def __init__(self, mapping=None, eval_strings=False, **kwargs):
+    def __init__(self, context, mapping=None, eval_strings=False, **kwargs):
         super().__init__(
+            context,
             mapping,
             eval_strings,
             api_args={'oem': OEM.DEFAULT, 'psm': PSM.SINGLE_CHAR},
             **kwargs)
-        self.processing_mode.frequency = 10
+        self.processing_mode.frequency = {'hertz': 10}
         self._mser = cv2.MSER_create(max_variation=0.25)
+        self.name = 'tesseract-ocr-mser'
 
-    @RunEachFrame(num_frames=30, callback=BaseModule.log_performace)
+    @RunOnFrame(num_frames=30, callback=BaseModule.log_performace)
     def on_processing(self, context):
         super().on_processing(context)
         if self.image:
@@ -236,14 +243,16 @@ class TesseractOCR_EAST(BaseModule):
                          eval_strings,
                          api_args=api_args or {'oem': OEM.DEFAULT, 'psm': PSM.AUTO},
                          **kwargs)
+        self.processing_mode.frequency = {'hertz': 10}
         self._output_layers = ["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"]
         from . import data
         with importlib_resources.path(data, "frozen_east_text_detection.pb") as east_model:
             self._detector = cv2.dnn.readNet(os.fspath(east_model))
 
         self._detector_input_shape = (320, 320)
+        self.name = 'tesseract-ocr-east'
 
-    @RunEachFrame(num_frames=30, callback=BaseModule.log_performace)
+    @RunOnFrame(num_frames=30, callback=BaseModule.log_performace)
     def on_processing(self, context):
         super().on_processing(context)
         if self.image:
