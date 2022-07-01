@@ -1,4 +1,6 @@
 /.idea
 /.ipynb_checkpoints
 /logs
-/src/ubii_interact_ocr_module.egg-info
+/src/*.egg-info
+__pycache__
+dist
