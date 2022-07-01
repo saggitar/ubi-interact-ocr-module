@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from functools import wraps, partial
 
@@ -22,6 +23,7 @@ import cv2.cv2 as cv2  # pycharm is stupid
 
 import ubii.proto as ub
 from ubii.framework.processing import ProcessingRoutine
+from ubii.framework.util import debug
 
 try:
     from PIL import Image
@@ -116,6 +118,9 @@ class BaseModule(ProcessingRoutine):
 
         return data
 
+    def log_performance(self, context):
+        log.info(f"Performance of {self!r}: {context.scheduler.performance_rating:.2%}")
+
     @property
     def api(self):
         return self._api
@@ -126,10 +131,15 @@ class BaseModule(ProcessingRoutine):
 
     def on_created(self, context):
         super().on_created(context)
-        self._loop = context.loop
 
-    def log_performace(self, context):
-        log.info(f"Performance: {context.scheduler.performance_rating:.2%}")
+    def on_processing(self, context):
+        super().on_processing(context)
+        self._image = context.inputs.image
+
+    def on_destroyed(self, context):
+        self.api.__exit__(None, None, None)
+        self._executor_pool.shutdown(wait=True)
+        return super().on_destroyed(context)
 
     def ocr_in_box(self, box, min_confidence=70):
         self.api.SetRectangle(*box)
@@ -150,19 +160,11 @@ class BaseModule(ProcessingRoutine):
             }
         )
 
-    def to_image_space(self, dimensions, box):
+    @staticmethod
+    def to_image_space(dimensions, box):
         width, height = dimensions
         x, y, w, h = box
         return x / width, y / height, w / width, h / height
-
-    def on_processing(self, context):
-        super().on_processing(context)
-        self._image = context.inputs.image
-
-    def on_destroyed(self, context):
-        self.api.__exit__(None, None, None)
-        self._executor_pool.shutdown(wait=True)
-        return super().on_destroyed(context)
 
     @staticmethod
     def box2rec(box):
@@ -174,9 +176,11 @@ class BaseModule(ProcessingRoutine):
         x1, y1, x2, y2 = rec
         return x1, y1, x2 - x1, y2 - y1
 
+    def __repr__(self):
+        return f"{self.__class__}<processing_mode: {self.processing_mode}>"
+
 
 class TesseractOCR_PURE(BaseModule):
-
 
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
         super().__init__(context, mapping, eval_strings, api_args, **kwargs)
@@ -198,7 +202,7 @@ class TesseractOCR_PURE(BaseModule):
                     result.id = text
                     results.append(result)
 
-        context.outputs.predictions = ub.Object2DList(elements=results)
+        context.outputs.predictions = ub.TopicDataRecord(object2D_list={'elements': results})
 
 
 class TesseractOCR_MSER(BaseModule):
@@ -214,7 +218,6 @@ class TesseractOCR_MSER(BaseModule):
         self._mser = cv2.MSER_create(max_variation=0.25)
         self.name = 'tesseract-ocr-mser'
 
-    @RunOnFrame(num_frames=30, callback=BaseModule.log_performace)
     def on_processing(self, context):
         super().on_processing(context)
         if self.image:
@@ -231,8 +234,7 @@ class TesseractOCR_MSER(BaseModule):
                     results.append(result)
 
             if results:
-                context.outputs.predictions = ub.Object2DList(elements=results)
-                # log.info(f"Detected Text[s]:\n" + '\n'.join(map('{!r}'.format, results)))
+                context.outputs.predictions = ub.TopicDataRecord(object2D_list={'elements': results})
 
 
 class TesseractOCR_EAST(BaseModule):
@@ -252,7 +254,6 @@ class TesseractOCR_EAST(BaseModule):
         self._detector_input_shape = (320, 320)
         self.name = 'tesseract-ocr-east'
 
-    @RunOnFrame(num_frames=30, callback=BaseModule.log_performace)
     def on_processing(self, context):
         super().on_processing(context)
         if self.image:
@@ -269,10 +270,10 @@ class TesseractOCR_EAST(BaseModule):
                 results.append(result)
 
             if results:
-                context.outputs.predictions = ub.Object2DList(elements=results)
-                # log.info(f"Detected Text[s]:\n" + '\n'.join(map('{!r}'.format, results)))
+                context.outputs.predictions = ub.TopicDataRecord(object2D_list={'elements': results})
 
-    def to_image_space(self, dimensions, box):
+    @staticmethod
+    def to_image_space(dimensions, box):
         x, y, w, h = super().to_image_space(dimensions, box)
         return x * 0.5, y, w, h  # opencv coordinate system
 
@@ -322,3 +323,9 @@ class TesseractOCR_EAST(BaseModule):
         start_points = np.array([end_points[0] - widths, end_points[1] - heights])
         # return bounding boxes and associated confidence_val
         return np.vstack((start_points, widths, heights)).T, confidence[mask]
+
+
+if debug():
+    # decorate on processing callbacks in debug mode
+    for cls in (TesseractOCR_EAST, TesseractOCR_PURE, TesseractOCR_MSER):
+        cls.on_processing = RunOnFrame(num_frames=30, callback=BaseModule.log_performance)(cls.on_processing)
