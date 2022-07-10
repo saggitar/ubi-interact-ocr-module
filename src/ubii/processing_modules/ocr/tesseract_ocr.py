@@ -2,28 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import os
+import warnings
 from functools import wraps, partial
 
 import numpy as np
+
+import ubii.proto
 
 try:
     import importlib.resources as importlib_resources
 except ImportError:
     # Try backported to PY<=37 `importlib_resources`.
-    import importlib_resources
+    import importlib_resources  # noqa
 
 try:
     from functools import cached_property
 except ImportError:
-    from backports.cached_property import cached_property
+    from backports.cached_property import cached_property  # noqa
 
 import logging
 from tesserocr import PyTessBaseAPI, RIL, OEM, PSM
-import cv2.cv2 as cv2  # pycharm is stupid
+import cv2.cv2 as cv2
 
 import ubii.proto as ub
 from ubii.framework.processing import ProcessingRoutine
-from ubii.framework.util import debug
 
 try:
     from PIL import Image
@@ -33,6 +35,7 @@ except ImportError:
 __protobuf__ = ub.__protobuf__
 
 log = logging.getLogger(__name__)
+perf_log = logging.getLogger(__name__ + '.performance')
 
 num_channels = {
     ub.Image2D.DataFormat.RGB8: 3,
@@ -52,26 +55,8 @@ bgr_conversions = {
 }
 
 
-class RunOnFrame:
-    def __init__(self, num_frames, callback):
-        self.processing_count = 0
-        self.num_frames = num_frames
-        self.callback = callback
-
-    def __call__(self, processing_callback):
-        @wraps(processing_callback)
-        def wrapped(processing_routine, context):
-            self.processing_count += 1
-            if self.processing_count % self.num_frames == 0:
-                self.callback(processing_routine, context)
-                self.processing_count = 0
-
-            processing_callback(processing_routine, context)
-
-        return wrapped
-
-
 class BaseModule(ProcessingRoutine):
+    _performance_lines = []
 
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
         super().__init__(mapping, eval_strings, **kwargs)
@@ -95,31 +80,38 @@ class BaseModule(ProcessingRoutine):
 
         self.processing_mode = {
             'frequency': {
-                'hertz': 5
+                'hertz': 30
             }
         }
 
+        self._image: ubii.proto.Image2D | None = None
+        self._api: PyTessBaseAPI | None = None
+        self._api_args = api_args
+        self._framecount = 0
+
+    def on_init(self, context) -> None:
+        super().on_init(context)
         self._image = None
-        self._api = PyTessBaseAPI(**(api_args or {}))
+        self._api = PyTessBaseAPI(**(self._api_args or {}))
+        perf_log.info(f"Starting {self}")
 
     def read_image(self, image: ub.Image2D, conversion=bgr_conversions.get):
-        data = np.frombuffer(
+        raw = np.frombuffer(
             bytearray(image.data), np.uint8
         ).reshape(
             (image.height, image.width, num_channels.get(image.data_format))
         )
-        conversion = conversion(image.data_format)
-        if conversion:
-            data = cv2.cvtColor(data, conversion)
 
-        gray = cv2.cvtColor(data, grayscale_conversions.get(image.data_format))
+        conversion = conversion(image.data_format)
+
         # tesserocr needs pillow image
+        gray = cv2.cvtColor(raw, grayscale_conversions.get(image.data_format))
         self.api.SetImage(Image.fromarray(gray, mode='L'))
 
-        return data
+        return cv2.cvtColor(raw, conversion) if conversion else raw
 
     def log_performance(self, context):
-        log.info(f"Performance of {self!r}: {context.scheduler.performance_rating:.2%}")
+        self._performance_lines.append(f"Performance of {self!r}: {context.scheduler.performance_rating:.2%}")
 
     @property
     def api(self):
@@ -134,11 +126,23 @@ class BaseModule(ProcessingRoutine):
 
     def on_processing(self, context):
         super().on_processing(context)
-        self._image = context.inputs.image
+        if context.inputs.image:
+            self._image = context.inputs.image.image2D
+
+        self._framecount += 1
+        if self._framecount % 10 == 0:
+            self.log_performance(context)
+            self._framecount = 0
 
     def on_destroyed(self, context):
+        import time
+        time.sleep(1)
+
         self.api.__exit__(None, None, None)
-        self._executor_pool.shutdown(wait=True)
+        perf_log.info(f"Collected {len(self._performance_lines)} perfomance informations")
+        for line in self._performance_lines:
+            perf_log.info(line)
+
         return super().on_destroyed(context)
 
     def ocr_in_box(self, box, min_confidence=70):
@@ -188,7 +192,8 @@ class TesseractOCR_PURE(BaseModule):
 
     def on_processing(self, context):
         super().on_processing(context)
-        results = []
+        predictions = ub.TopicDataRecord()
+
         if self.image:
             loaded = Image.frombuffer('RGB', (self.image.width, self.image.height), self.image.data)
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
@@ -200,41 +205,48 @@ class TesseractOCR_PURE(BaseModule):
                 if text:
                     result = self.object_2d_from_box(scale((box['x'], box['y'], box['w'], box['h'])))
                     result.id = text
-                    results.append(result)
+                    predictions.object2D_list.elements.append(result)
 
-        context.outputs.predictions = ub.TopicDataRecord(object2D_list={'elements': results})
+        if predictions.object2D_list.elements:
+            context.outputs.predictions = predictions
 
 
 class TesseractOCR_MSER(BaseModule):
 
-    def __init__(self, context, mapping=None, eval_strings=False, **kwargs):
+    def __init__(self, context, mapping=None, eval_strings=False, api_args=None, mser_args=None, **kwargs):
+
         super().__init__(
             context,
             mapping,
             eval_strings,
-            api_args={'oem': OEM.DEFAULT, 'psm': PSM.SINGLE_CHAR},
+            api_args=api_args or {'oem': OEM.DEFAULT, 'psm': PSM.SINGLE_CHAR},
             **kwargs)
         self.processing_mode.frequency = {'hertz': 10}
-        self._mser = cv2.MSER_create(max_variation=0.25)
+        self._mser = cv2.MSER_create(**(mser_args or {'max_variation': 0.25}))
         self.name = 'tesseract-ocr-mser'
+
+    def on_init(self, context) -> None:
+        warnings.warn("The MSER module seems to have some issues with segfaults in OpenCV code, probably depending"
+                      "on OpenCV version.")
+        super().on_init(context)
 
     def on_processing(self, context):
         super().on_processing(context)
         if self.image:
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
             gray = self.read_image(self.image, conversion=grayscale_conversions.get)
-            _, bounding_boxes = self.data.mser.detectRegions(gray)
+            _, bounding_boxes = self._mser.detectRegions(gray)
 
-            results = []
+            predictions = ub.TopicDataRecord()
             for box in bounding_boxes:
                 text = self.ocr_in_box(box)
                 if text:
                     result = self.object_2d_from_box(scale(box))
                     result.id = text
-                    results.append(result)
+                    predictions.object2D_list.elements.append(result)
 
-            if results:
-                context.outputs.predictions = ub.TopicDataRecord(object2D_list={'elements': results})
+            if predictions.object2D_list.elements:
+                context.outputs.predictions = predictions
 
 
 class TesseractOCR_EAST(BaseModule):
@@ -260,21 +272,21 @@ class TesseractOCR_EAST(BaseModule):
             bgr = self.read_image(self.image)
             bounding_boxes = self.predict(bgr, input_shape=self._detector_input_shape)
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
-            results = []
+            predictions = ub.TopicDataRecord()
             for box in bounding_boxes:
                 padding = 40
                 x, y, w, h = box.astype(int)
                 padded = x - padding // 2, y - padding // 2, w + padding, h + padding
                 result = self.object_2d_from_box(scale(padded))
                 result.id = self.ocr_in_box(padded)
-                results.append(result)
+                predictions.object2D_list.elements.append(result)
 
-            if results:
-                context.outputs.predictions = ub.TopicDataRecord(object2D_list={'elements': results})
+            if predictions.object2D_list.elements:
+                context.outputs.predictions = predictions
 
     @staticmethod
     def to_image_space(dimensions, box):
-        x, y, w, h = super().to_image_space(dimensions, box)
+        x, y, w, h = super(TesseractOCR_EAST, TesseractOCR_EAST).to_image_space(dimensions, box)
         return x * 0.5, y, w, h  # opencv coordinate system
 
     def predict(self, image, input_shape=(320, 320), conf=0.7, nms_threshold=0.5):
@@ -323,9 +335,3 @@ class TesseractOCR_EAST(BaseModule):
         start_points = np.array([end_points[0] - widths, end_points[1] - heights])
         # return bounding boxes and associated confidence_val
         return np.vstack((start_points, widths, heights)).T, confidence[mask]
-
-
-if debug():
-    # decorate on processing callbacks in debug mode
-    for cls in (TesseractOCR_EAST, TesseractOCR_PURE, TesseractOCR_MSER):
-        cls.on_processing = RunOnFrame(num_frames=30, callback=BaseModule.log_performance)(cls.on_processing)

@@ -1,0 +1,14 @@
+version: 1
+handlers:
+  processing:
+    class : logging.FileHandler
+    formatter: precise
+    level: DEBUG
+    filename: processing.log
+    mode: w
+loggers:
+  ubii.processing_modules.ocr.tesseract_ocr:
+    propagate: no
+    handlers: [processing]
+
+incremental: yes
