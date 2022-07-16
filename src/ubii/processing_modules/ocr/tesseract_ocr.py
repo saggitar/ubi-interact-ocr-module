@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import os
-import warnings
-from functools import wraps, partial
+from functools import partial
 
 import numpy as np
 
@@ -56,6 +54,11 @@ bgr_conversions = {
 
 
 class BaseModule(ProcessingRoutine):
+    """
+    All OCR Modules inherit from this processing module.
+    It supplies the basic functionality of loading images and
+    transforming them, and defines the protobuf specs
+    """
     _performance_lines = []
 
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
@@ -80,7 +83,7 @@ class BaseModule(ProcessingRoutine):
 
         self.processing_mode = {
             'frequency': {
-                'hertz': 30
+                'hertz': 10
             }
         }
 
@@ -111,7 +114,7 @@ class BaseModule(ProcessingRoutine):
         return cv2.cvtColor(raw, conversion) if conversion else raw
 
     def log_performance(self, context):
-        self._performance_lines.append(f"Performance of {self!r}: {context.scheduler.performance_rating:.2%}")
+        self._performance_lines.append(f"Performance of {self!r}: {context.scheduler.performance_rating}")
 
     @property
     def api(self):
@@ -181,10 +184,14 @@ class BaseModule(ProcessingRoutine):
         return x1, y1, x2 - x1, y2 - y1
 
     def __repr__(self):
-        return f"{self.__class__}<processing_mode: {self.processing_mode}>"
+        return f"{self.__class__}<processing_mode: {type(self.processing_mode).to_dict(self.processing_mode)}>"
 
 
 class TesseractOCR_PURE(BaseModule):
+    """
+    This module uses pure Tesseract OCR functionality without preprocessing
+    to extract text bounding boxes and perform OCR in them
+    """
 
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
         super().__init__(context, mapping, eval_strings, api_args, **kwargs)
@@ -195,9 +202,8 @@ class TesseractOCR_PURE(BaseModule):
         predictions = ub.TopicDataRecord()
 
         if self.image:
-            loaded = Image.frombuffer('RGB', (self.image.width, self.image.height), self.image.data)
+            self.read_image(self.image)
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
-            self.api.SetImage(loaded)
             boxes = self.api.GetComponentImages(RIL.TEXTLINE, True)
 
             for i, (im, box, _, _) in enumerate(boxes):
@@ -212,6 +218,10 @@ class TesseractOCR_PURE(BaseModule):
 
 
 class TesseractOCR_MSER(BaseModule):
+    """
+    This module uses the MSER algorithm to perform preprocessing and extract _character_ bounding
+    boxes and performs OCR using Tesseract for the characters in those boxes
+    """
 
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, mser_args=None, **kwargs):
 
@@ -226,8 +236,8 @@ class TesseractOCR_MSER(BaseModule):
         self.name = 'tesseract-ocr-mser'
 
     def on_init(self, context) -> None:
-        warnings.warn("The MSER module seems to have some issues with segfaults in OpenCV code, probably depending"
-                      "on OpenCV version.")
+        log.warning("The MSER module seems to have some issues with segfaults in OpenCV code, "
+                    "probably depending on OpenCV version.")
         super().on_init(context)
 
     def on_processing(self, context):
@@ -250,6 +260,11 @@ class TesseractOCR_MSER(BaseModule):
 
 
 class TesseractOCR_EAST(BaseModule):
+    """
+    This module uses the EAST algorithm to preprocess
+    the image and extract text bounding boxes, then uses Tesseract for
+    OCR inside the boxes
+    """
 
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
         super().__init__(context,
@@ -274,7 +289,7 @@ class TesseractOCR_EAST(BaseModule):
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
             predictions = ub.TopicDataRecord()
             for box in bounding_boxes:
-                padding = 40
+                padding = 20
                 x, y, w, h = box.astype(int)
                 padded = x - padding // 2, y - padding // 2, w + padding, h + padding
                 result = self.object_2d_from_box(scale(padded))
@@ -287,7 +302,7 @@ class TesseractOCR_EAST(BaseModule):
     @staticmethod
     def to_image_space(dimensions, box):
         x, y, w, h = super(TesseractOCR_EAST, TesseractOCR_EAST).to_image_space(dimensions, box)
-        return x * 0.5, y, w, h  # opencv coordinate system
+        return x, y, w, h  # opencv coordinate system
 
     def predict(self, image, input_shape=(320, 320), conf=0.7, nms_threshold=0.5):
         orig_h, orig_w = image.shape[:2]
