@@ -1,3 +1,11 @@
+"""
+Consider setting your locale to C, e.g. by exporting LC_CTYPE=C
+since tesseract code sometimes segfaults if the locale is set incorrectly.
+
+Seems to be related to https://github.com/sirfz/tesserocr/issues/165 which seems to be fixed in
+tesseract but not in the leptonica library see https://github.com/DanBloomberg/leptonica/issues/591
+"""
+
 from __future__ import annotations
 
 import os
@@ -62,7 +70,6 @@ class BaseModule(ProcessingRoutine):
     It supplies the basic functionality of loading images and
     transforming them, and defines the protobuf specs
     """
-    _performance_lines = []
 
     def __init__(
             self,
@@ -107,15 +114,16 @@ class BaseModule(ProcessingRoutine):
 
         self.processing_mode = {
             'frequency': {
-                'hertz': 10
+                'hertz': 60
             }
         }
 
         self._image: ubii.proto.Image2D | None = None
         self._api: PyTessBaseAPI | None = None
         self._api_args = api_args
-        self._framecount = 0
         self._filter_empty_boxes = filter_empty_boxes
+        self._log_performance_in_next_frame = False
+        self._performance_values = []
         self._ocr_confidence = ocr_confidence
 
     @property
@@ -133,7 +141,7 @@ class BaseModule(ProcessingRoutine):
         super().on_init(context)
         self._image = None
         self._api = PyTessBaseAPI(**(self._api_args or {}))
-        perf_log.info(f"Starting {self}")
+        log.info(f"Starting {self}")
 
     def read_image(self, image: ub.Image2D, conversion=bgr_conversions.get):
         """
@@ -169,7 +177,9 @@ class BaseModule(ProcessingRoutine):
         Just save some info of the module performance. Get's logged when module is destroyed since
         logging during processing would decrease performance significantly.
         """
-        self._performance_lines.append(f"Performance of {self!r}: {context.scheduler.performance_rating}")
+        if self._log_performance_in_next_frame:
+            self._performance_values.append(context.scheduler.exec_delta_times[-1])
+            self._log_performance_in_next_frame = False
 
     @property
     def api(self) -> PyTessBaseAPI | None:
@@ -193,13 +203,11 @@ class BaseModule(ProcessingRoutine):
         Load image from input, also save performance info
         """
         super().on_processing(context)
+        self.log_performance(context)
+
         if context.inputs.image:
             self._image = context.inputs.image.image2D
-
-        self._framecount += 1
-        if self._framecount % 10 == 0:
-            self.log_performance(context)
-            self._framecount = 0
+            self._log_performance_in_next_frame = True
 
     def on_destroyed(self, context):
         """
@@ -209,9 +217,10 @@ class BaseModule(ProcessingRoutine):
         time.sleep(1)
 
         self.api.__exit__(None, None, None)
-        perf_log.info(f"Collected {len(self._performance_lines)} perfomance informations")
-        for line in self._performance_lines:
-            perf_log.info(line)
+        self._api = None
+
+        log.info(f"Collected {len(self._performance_values)} execution times with input")
+        perf_log.info(','.join(map('{:.4g}'.format, self._performance_values)))
 
         return super().on_destroyed(context)
 
@@ -294,18 +303,23 @@ class BaseModule(ProcessingRoutine):
         return x1, y1, x2 - x1, y2 - y1
 
     @staticmethod
-    def padded(box: PixelBox, padding: int = 1):
+    def padded(box: PixelBox, padding: int = 0, dimensions: typing.Tuple[int, int] | None = None):
         """
         Expand box by padding in all directions
         Args:
             box: tuple of x, y, width, height
-            padding: amount of pixels that should be padded around box
+            padding: amount of pixels that should be padded around box.
+            dimensions: used for clipping
 
         Returns:
             box: tuple of x, y, width, height for expanded box
         """
         x, y, w, h, = box
-        return x - padding, y - padding, w + padding * 2, h + padding * 2
+        padded = np.clip((x - padding, y - padding, w + padding * 2, h + padding * 2), a_min=0, a_max=None)
+
+        x_max, y_max = dimensions
+        max_vals = [x_max, y_max, x_max - padded[0], y_max - padded[1]]
+        return np.clip(padded, a_min=None, a_max=max_vals)
 
     def __repr__(self):
         return f"{self.__class__}<processing_mode: {type(self.processing_mode).to_dict(self.processing_mode)}>"
@@ -318,7 +332,10 @@ class TesseractOCR_PURE(BaseModule):
     """
 
     def __init__(self, context, mapping=None, eval_strings=False, api_args=None, **kwargs):
-        super().__init__(context, mapping, eval_strings, api_args, **kwargs)
+        super().__init__(
+            context, mapping, eval_strings, api_args=api_args or {'oem': OEM.DEFAULT, 'psm': PSM.AUTO_OSD},
+            **kwargs
+        )
         self.name = 'tesseract-ocr-pure'
 
     def on_processing(self, context):
@@ -328,12 +345,13 @@ class TesseractOCR_PURE(BaseModule):
         if self.image:
             self.read_image(self.image)
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
+            pad = partial(self.padded, dimensions=(self.image.width, self.image.height))
             boxes = self.api.GetComponentImages(RIL.TEXTLINE, True)
 
             for _, region, _, _ in boxes:
                 box = region['x'], region['y'], region['w'], region['h']
                 result = self.object_2d_from_box(scale(box))
-                result.id = self.ocr_in_box(self.padded(box, padding=10), min_confidence=self.ocr_confidence) or None
+                result.id = self.ocr_in_box(pad(box, padding=10), min_confidence=self.ocr_confidence) or None
                 if not self.filter_empty_boxes or result.id:
                     predictions.object2D_list.elements.append(result)
 
@@ -347,7 +365,38 @@ class TesseractOCR_MSER(BaseModule):
     boxes and performs OCR using Tesseract for the characters in those boxes
     """
 
-    def __init__(self, context, mapping=None, eval_strings=False, api_args=None, mser_args=None, **kwargs):
+    COLOR_ONLY_MSER_OPTS = [
+        "min_diversity",
+        "max_evolution",
+        "area_threshold",
+        "min_margin",
+        "edge_blur_size"
+    ]
+    """
+    These options are only usable with colored input images, if any are present in the dictionary
+    passed as `mser_args` during initialization, the module will not use a grayscale conversion for the
+    MSER algorithm which will result in longer processing times
+    """
+
+    def __init__(
+            self,
+            context,
+            mser_grayscale: bool = True,
+            padding=2,
+            mapping=None,
+            eval_strings=False,
+            api_args=None,
+            mser_args=None,
+            **kwargs
+    ):
+        """
+        Create a MSER preprocessing module
+
+        Args:
+            mser_grayscale: if True, run MSER algorithm on grayscale version of input image
+            padding: the value used to pad all extracted regions before OCR is performed
+            mser_args: passed to :func:`cv2.MSER_create`, default `{'max_variation': 0.25}`
+        """
 
         super().__init__(
             context,
@@ -355,13 +404,13 @@ class TesseractOCR_MSER(BaseModule):
             eval_strings,
             api_args=api_args or {'oem': OEM.DEFAULT, 'psm': PSM.SINGLE_CHAR},
             **kwargs)
-        self.processing_mode.frequency = {'hertz': 10}
+        # self.processing_mode.frequency = {'hertz': 20}
         self._mser = cv2.MSER_create(**(mser_args or {'max_variation': 0.25}))
+        self._padding = padding
+        self._mser_grayscale = mser_grayscale or any(opt in mser_args for opt in self.COLOR_ONLY_MSER_OPTS)
         self.name = 'tesseract-ocr-mser'
 
     def on_init(self, context) -> None:
-        log.warning("The MSER module seems to have some issues with segfaults in OpenCV code, "
-                    "probably depending on OpenCV version.")
         super().on_init(context)
 
     @classmethod
@@ -385,6 +434,7 @@ class TesseractOCR_MSER(BaseModule):
             r2, b2, l2, t2 = rec2
             return r1 <= r2 and l1 >= l2 and t1 >= t2 and b1 <= b2
 
+        # This could be vectorized like in the EAST module
         rects = [cls.box2rec(box) for box in boxes]
         return [any(contains(r1, r2) for r1 in rects if r1 != r2) for r2 in rects]
 
@@ -392,14 +442,19 @@ class TesseractOCR_MSER(BaseModule):
         super().on_processing(context)
         if self.image:
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
-            gray = self.read_image(self.image, conversion=grayscale_conversions.get)
-            _, bounding_boxes = self._mser.detectRegions(gray)
+            pad = partial(self.padded, dimensions=(self.image.width, self.image.height))
+            mser_input = self.read_image(
+                self.image,
+                **({'conversion': grayscale_conversions.get} if self._mser_grayscale else {})
+            )
+            _, bounding_boxes = self._mser.detectRegions(mser_input)
             bounding_boxes = np.unique(bounding_boxes, axis=0)
             contained = np.array(self.contained(bounding_boxes))
             predictions = ub.TopicDataRecord()
             for box in bounding_boxes[~contained, :]:
+                box = pad(box, self._padding)
                 result = self.object_2d_from_box(scale(box))
-                result.id = self.ocr_in_box(self.padded(box, padding=2), min_confidence=self.ocr_confidence) or None
+                result.id = self.ocr_in_box(box, min_confidence=self.ocr_confidence) or None
                 if not self.filter_empty_boxes or result.id:
                     predictions.object2D_list.elements.append(result)
 
@@ -442,7 +497,7 @@ class TesseractOCR_EAST(BaseModule):
                          eval_strings,
                          api_args=api_args or {'oem': OEM.DEFAULT, 'psm': PSM.AUTO},
                          **kwargs)
-        self.processing_mode.frequency = {'hertz': 10}
+        # self.processing_mode.frequency = {'hertz': 10}
         self._output_layers = ["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"]
         from . import data
         with importlib_resources.path(data, "frozen_east_text_detection.pb") as east_model:
@@ -516,9 +571,10 @@ class TesseractOCR_EAST(BaseModule):
             )
 
             scale = partial(self.to_image_space, (self.image.width, self.image.height))
+            pad = partial(self.padded, dimensions=(self.image.width, self.image.height))
             predictions = ub.TopicDataRecord()
             for num, box in enumerate(b.astype(int) for b in bounding_boxes):
-                box = self.padded(box, padding=10)
+                box = pad(box, padding=10)
                 result = self.object_2d_from_box(scale(box))
                 result.id = self.ocr_in_box(box, min_confidence=self.ocr_confidence) or None
                 if not self.filter_empty_boxes or result.id:

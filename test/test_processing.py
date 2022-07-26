@@ -1,19 +1,20 @@
 import asyncio
 import functools
+import json
 import logging
 import os
-from typing import List
 
 import itertools
+import pandas as pd
 import pytest
+from tesserocr import OEM, PSM
 
 import ubii.proto as ub
-from ubii.framework import processing
-from ubii.framework.client import InitProcessingModules, RunProcessingModules, Publish, Subscriptions
+from ubii.framework.client import InitProcessingModules, RunProcessingModules, Publish, Subscriptions, Sessions
 from ubii.processing_modules.ocr.tesseract_ocr import (
-    TesseractOCR_MSER,
+    TesseractOCR_PURE,
     TesseractOCR_EAST,
-    TesseractOCR_PURE
+    TesseractOCR_MSER
 )
 
 try:
@@ -42,7 +43,7 @@ proto_format_to_PIL = {v: k for k, v in PIL_to_proto_format.items()}
 
 
 @pytest.fixture(autouse=True, scope='session')
-def debug_settings():
+def debug_settings(configure_logging):
     """
     Don't turn on debug settings
     """
@@ -71,46 +72,20 @@ def image_data(data_dir, request):
 
 @pytest.fixture(scope='session')
 def font(data_dir, request):
-    fnt = ImageFont.truetype(os.fspath(data_dir / request.param), 40)
+    fnt = ImageFont.truetype(os.fspath(data_dir / getattr(request, 'param', 'TeX_Gyre_Heros_Regular.otf')), 40)
     yield fnt
 
 
-class TestOCRPerformance:
-    client_spec = [
-        pytest.param((ub.Client(is_dedicated_processing_node=True, ),), id='processing'),
-    ]
+@pytest.fixture(scope='session')
+def run_time(data_dir, request):
+    return getattr(request, 'param', 20)
 
-    late_init_module_spec = itertools.chain.from_iterable(
-        (
-            pytest.param((functools.partial(v, filter_empty_boxes=True),),
-                         id=f"{v!r}-empty"),
-            pytest.param((functools.partial(v, filter_empty_boxes=False),),
-                         id=f"{v!r}"),
-            pytest.param((functools.partial(v, filter_empty_boxes=True, ocr_confidence=50),),
-                         id=f"{v!r}-empty-50"),
-        )
-        for v in (
-            TesseractOCR_PURE,
-            functools.partial(
-                TesseractOCR_EAST,
-                nms_threshold=0.5,
-            ),
-            functools.partial(
-                TesseractOCR_EAST,
-                merge_bounding_boxes=True,
-                nms_threshold=0.7,
-            ),
-            functools.partial(
-                TesseractOCR_EAST,
-                nms_threshold=0.7,
-            ),
-            TesseractOCR_MSER,
-        )
-    )
+
+class TestOCRPerformance:
 
     @pytest.fixture(scope='class')
-    async def base_session(self, client, start_client) -> ub.Session:
-        await start_client(client)
+    async def base_session(self, client) -> ub.Session:
+        await client
         module = client.processing_modules[0]
         input_topic = f"{client.id}/test_input"
         output_topic = f"{client.id}/test_output"
@@ -132,69 +107,158 @@ class TestOCRPerformance:
             },
         ]
 
-        session = ub.Session(name=f"session-{client.id}",
+        session = ub.Session(name='OCR Session',
                              processing_modules=[module],
                              io_mappings=io_mappings)
 
-        return session
+        yield session
 
-    @pytest.fixture(autouse=True)
-    async def startup(self, client, start_client, stop_client, session_spec, start_session):
-        await start_client(client)
+    client_spec = [
+        pytest.param((ub.Client(is_dedicated_processing_node=True, ),), id='pm'),
+    ]
 
-        await client.implements(InitProcessingModules, RunProcessingModules)
-        await start_session(session_spec)
-
-        pm: processing.ProcessingRoutine = processing.ProcessingRoutine.registry[
-            session_spec.processing_modules[0].name
-        ]
-        async with pm.change_specs:
-            await pm.change_specs.wait_for(
-                lambda: pm.status == pm.Status.CREATED or pm.status == pm.Status.PROCESSING
-            )
-        yield
-        await stop_client(client)
+    late_init_module_spec = list(itertools.chain.from_iterable(
+        (
+            pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=True),
+                         id=f"{paramset.id}-empty"),
+            pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=False),
+                         id=f"{paramset.id}"),
+            pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=False, ocr_confidence=20),
+                         id=f"{paramset.id}-20"),
+            pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=True, ocr_confidence=50),
+                         id=f"{paramset.id}-empty-50"),
+        )
+        for paramset in (
+            # pytest.param(
+            #     TesseractOCR_PURE,
+            #     id='PURE'
+            # ),
+            # pytest.param(
+            #     functools.partial(
+            #         TesseractOCR_PURE,
+            #         api_args={'oem': OEM.DEFAULT, 'psm': PSM.SPARSE_TEXT_OSD}
+            #     ),
+            #     id='PURE-sparse'
+            # ),
+            # pytest.param(
+            #     TesseractOCR_MSER,
+            #     id='MSER'
+            # ),
+            # pytest.param(
+            #     functools.partial(
+            #         TesseractOCR_MSER,
+            #         padding=0,
+            #     ),
+            #     id='MSER-padding0'
+            # ),
+            # pytest.param(
+            #     functools.partial(
+            #         TesseractOCR_MSER,
+            #         padding=3,
+            #         mser_args={'max_variation': 0.02},
+            #     ),
+            #     id='MSER-padding3-variation0.02'
+            # ),
+            # pytest.param(
+            #     functools.partial(
+            #         TesseractOCR_MSER,
+            #         padding=3,
+            #     ),
+            #     id='MSER-padding3'
+            # ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_MSER,
+                    mser_args={'max_variation': 0.1}
+                ),
+                id='MSER-variation0.1'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_EAST,
+                    nms_threshold=0.5,
+                ),
+                id='EAST-nms0.5-no-merge'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_EAST,
+                    merge_bounding_boxes=True,
+                    nms_threshold=0.7,
+                ),
+                id='EAST-nms0.7-merge'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_EAST,
+                    nms_threshold=0.7,
+                ),
+                id='EAST-nms0.7-no-merge'
+            ),
+        )
+    ))
 
     @pytest.mark.parametrize('image_data', [
-        # pytest.param('test.png', id='testbild'),
+        pytest.param('test.png', id='test'),
+        pytest.param('webcam.png', id='webcam'),
         pytest.param('Ortseingangsschild_Ilmenau.jpg', id='ortsschild')
     ], indirect=True)
-    @pytest.mark.parametrize('timeout', [1])
-    @pytest.mark.parametrize('run_time', [4])
-    @pytest.mark.parametrize('font', [pytest.param('TeX_Gyre_Heros_Regular.otf', id='heros')], indirect=True)
     async def test_processing_module(
             self,
             client,
-            image_data: ub.Image2D,
-            base_session: ub.Session,
-            timeout,
-            run_time,
+            session_spec,
+            image_data,
+            request,
+            caplog,
             data_dir,
             font,
-            request,
+            event_loop,
+            reset_and_start_client,
+            run_time,
+            test_data,
     ):
-        received: List[ub.TopicDataRecord] = []
-        input_topic = base_session.io_mappings[0].input_mappings[0].topic
-        output_topic = base_session.io_mappings[0].output_mappings[0].topic
+        """
+        Actually starting and stopping the session should be done in a fixture, somehow the pycharm test runner
+        does not respect fixture order (or maybe it starts new tests when old tests tear down?) So that stopping
+        clients and sessions during teardown can not be consistently ordered. Therefor we do it in the test, which
+        sucks because when the test fails, the session is not stopped which could lead to unexpected behaviour.
+        Still, it is better this way, since I can't get the fixture order working when not in debug mode.
 
+        If tests fail, and you see memory leaks due to residual sessions in the broker, stop the test suite before
+        your system is clogged down!
+        """
+        caplog.set_level(logging.WARNING)
+        await client.implements(InitProcessingModules, RunProcessingModules, Sessions)
+
+        received_data = []
+        input_topic = session_spec.io_mappings[0].input_mappings[0].topic
+        output_topic = session_spec.io_mappings[0].output_mappings[0].topic
+        module_name = session_spec.processing_modules[0].name
+
+        started = await client[Sessions].start_session(session_spec)
+        pm = await client[RunProcessingModules].get_module_instance(module_name)
+
+        # first write performance data even for failed tests, disable by setting
+        # write_test_references=False in pytest.ini
+        interesting_values = {
+            'hz': pm.processing_mode.frequency.hertz,
+            'args': getattr(request.node.callspec.params['late_init_module_spec'], 'keywords', {}),
+        }
+
+        topics, tokens = await client[Subscriptions].subscribe_topic(output_topic).with_callback(received_data.append)
         await client[Publish].publish({
             'topic': input_topic,
             'image2D': image_data
         })
 
-        await asyncio.sleep(timeout)  # we wait until the broker processed the publishing
-        topics, tokens = await client[Subscriptions].subscribe_topic(output_topic).with_callback(received.append)
-        # if you subscribe to the same topic as before, you will immediately get the last value, therefore
-        # we publish before we subscribe!
+        start_time = event_loop.time()
+        while len(received_data) <= 50 and event_loop.time() - start_time < run_time:
+            await asyncio.sleep(1. / interesting_values['hz'])
 
-        await asyncio.sleep(run_time)
-        await topics[0].unregister_callback(tokens[0], timeout=timeout)
-        await client[Subscriptions].unsubscribe_topic(output_topic)
+        await topics[0].unregister_callback(tokens[0])
+        await client[Sessions].stop_session(started)
 
-        assert received, "No processed images received"
-        # assert all(received[0] == r for r in received)
-
-        boxes = received[-1].object2D_list
+        boxes = received_data[-1].object2D_list if received_data else []
         used = Image.frombuffer(
             proto_format_to_PIL[image_data.data_format],
             (image_data.width, image_data.height),
@@ -202,11 +266,21 @@ class TestOCRPerformance:
         )
         draw = ImageDraw.Draw(used)
 
-        for box in boxes.elements:
+        for box in (boxes.elements if boxes else ()):
             x, y = box.pose.position.x * image_data.width, box.pose.position.y * image_data.height
             w, h = box.size.x * image_data.width, box.size.y * image_data.height
 
-            draw.rectangle(((x, y), (x + w, y + h)), outline=(0, 255, 0))
-            draw.text((x + w, y), text=box.id, font=font, anchor='rb', fill=(0, 255, 0))
+            draw.rectangle(((x, y), (x + w, y + h)), outline=(0, 255, 0), width=2)
+            draw.text((x + w, y), text=box.id.replace('\n', '|'), font=font, anchor='rb', fill=(0, 255, 0))
 
-        used.save(data_dir / 'results' / f"{request.node.callspec.id}.png")
+        execution_times = pd.Series(pm._performance_values[1:])  # ignore first value where module started up
+
+        with test_data.write(f"stats.txt") as f:
+            statistics = execution_times.describe().to_frame().T
+            statistics['relative std'] = statistics['std'] / statistics['mean']
+            statistics.to_csv(f, index=False, float_format='%.4f')
+
+        used.save(test_data.path("image.png"))
+
+        with test_data.write(f"arguments.json") as f:
+            json.dump(interesting_values, f)
