@@ -4,6 +4,7 @@ import json
 import logging
 import os
 
+import gc
 import itertools
 import pandas as pd
 import pytest
@@ -12,9 +13,9 @@ from tesserocr import OEM, PSM
 import ubii.proto as ub
 from ubii.framework.client import InitProcessingModules, RunProcessingModules, Publish, Subscriptions, Sessions
 from ubii.processing_modules.ocr.tesseract_ocr import (
-    TesseractOCR_PURE,
     TesseractOCR_EAST,
-    TesseractOCR_MSER
+    TesseractOCR_MSER,
+    TesseractOCR_PURE
 )
 
 try:
@@ -123,55 +124,67 @@ class TestOCRPerformance:
                          id=f"{paramset.id}-empty"),
             pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=False),
                          id=f"{paramset.id}"),
+            pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=True, ocr_confidence=60),
+                         id=f"{paramset.id}-empty-60"),
+            pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=True, ocr_confidence=20),
+                         id=f"{paramset.id}-empty-20"),
             pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=False, ocr_confidence=20),
                          id=f"{paramset.id}-20"),
-            pytest.param(functools.partial(paramset.values[0], filter_empty_boxes=True, ocr_confidence=50),
-                         id=f"{paramset.id}-empty-50"),
+            pytest.param(
+                functools.partial(
+                    paramset.values[0],
+                    filter_empty_boxes=False,
+                    ocr_confidence=0,
+                    result_fmt='{text} ({conf})'
+                ),
+                id=f"{paramset.id}-confvals"),
         )
         for paramset in (
-            # pytest.param(
-            #     TesseractOCR_PURE,
-            #     id='PURE'
-            # ),
-            # pytest.param(
-            #     functools.partial(
-            #         TesseractOCR_PURE,
-            #         api_args={'oem': OEM.DEFAULT, 'psm': PSM.SPARSE_TEXT_OSD}
-            #     ),
-            #     id='PURE-sparse'
-            # ),
-            # pytest.param(
-            #     TesseractOCR_MSER,
-            #     id='MSER'
-            # ),
-            # pytest.param(
-            #     functools.partial(
-            #         TesseractOCR_MSER,
-            #         padding=0,
-            #     ),
-            #     id='MSER-padding0'
-            # ),
-            # pytest.param(
-            #     functools.partial(
-            #         TesseractOCR_MSER,
-            #         padding=3,
-            #         mser_args={'max_variation': 0.02},
-            #     ),
-            #     id='MSER-padding3-variation0.02'
-            # ),
-            # pytest.param(
-            #     functools.partial(
-            #         TesseractOCR_MSER,
-            #         padding=3,
-            #     ),
-            #     id='MSER-padding3'
-            # ),
+            pytest.param(
+                TesseractOCR_PURE,
+                id='PURE'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_PURE,
+                    api_args={'oem': OEM.DEFAULT, 'psm': PSM.SPARSE_TEXT_OSD}
+                ),
+                id='PURE-sparse'
+            ),
+            pytest.param(
+                TesseractOCR_MSER,
+                id='MSER'
+            ),
             pytest.param(
                 functools.partial(
                     TesseractOCR_MSER,
-                    mser_args={'max_variation': 0.1}
+                    padding=0,
                 ),
-                id='MSER-variation0.1'
+                id='MSER-padding0'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_MSER,
+                    padding=3,
+                    mser_args={'max_variation': 0.02},
+                ),
+                id='MSER-padding3-variation0.02'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_MSER,
+                    padding=3,
+                ),
+                id='MSER-padding3'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_MSER,
+                    padding=3,
+                    mser_args={'max_variation': 0.1},
+                    api_variables={'tessedit_char_whitelist': "ABCDFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"},
+                ),
+                id='MSER-variation0.1-charwhitelist'
             ),
             pytest.param(
                 functools.partial(
@@ -184,13 +197,22 @@ class TestOCRPerformance:
                 functools.partial(
                     TesseractOCR_EAST,
                     merge_bounding_boxes=True,
-                    nms_threshold=0.7,
+                    nms_threshold=0.6,
                 ),
-                id='EAST-nms0.7-merge'
+                id='EAST-nms0.6-merge'
             ),
             pytest.param(
                 functools.partial(
                     TesseractOCR_EAST,
+                    merge_bounding_boxes=False,
+                    nms_threshold=0.6,
+                ),
+                id='EAST-nms0.6-no-merge'
+            ),
+            pytest.param(
+                functools.partial(
+                    TesseractOCR_EAST,
+                    merge_bounding_boxes=False,
                     nms_threshold=0.7,
                 ),
                 id='EAST-nms0.7-no-merge'
@@ -199,9 +221,9 @@ class TestOCRPerformance:
     ))
 
     @pytest.mark.parametrize('image_data', [
-        pytest.param('test.png', id='test'),
+        # pytest.param('test.png', id='test'),
         pytest.param('webcam.png', id='webcam'),
-        pytest.param('Ortseingangsschild_Ilmenau.jpg', id='ortsschild')
+        # pytest.param('Ortseingangsschild_Ilmenau.jpg', id='ortsschild')
     ], indirect=True)
     async def test_processing_module(
             self,
@@ -226,8 +248,12 @@ class TestOCRPerformance:
 
         If tests fail, and you see memory leaks due to residual sessions in the broker, stop the test suite before
         your system is clogged down!
+
+
         """
         caplog.set_level(logging.WARNING)
+        caplog.clear()
+
         await client.implements(InitProcessingModules, RunProcessingModules, Sessions)
 
         received_data = []
@@ -265,6 +291,7 @@ class TestOCRPerformance:
             image_data.data
         )
         draw = ImageDraw.Draw(used)
+        words = []
 
         for box in (boxes.elements if boxes else ()):
             x, y = box.pose.position.x * image_data.width, box.pose.position.y * image_data.height
@@ -272,8 +299,12 @@ class TestOCRPerformance:
 
             draw.rectangle(((x, y), (x + w, y + h)), outline=(0, 255, 0), width=2)
             draw.text((x + w, y), text=box.id.replace('\n', '|'), font=font, anchor='rb', fill=(0, 255, 0))
+            words.append(box.id)
 
         execution_times = pd.Series(pm._performance_values[1:])  # ignore first value where module started up
+
+        with test_data.write('words.txt') as f:
+            f.write(', '.join(words))
 
         with test_data.write(f"stats.txt") as f:
             statistics = execution_times.describe().to_frame().T
@@ -284,3 +315,5 @@ class TestOCRPerformance:
 
         with test_data.write(f"arguments.json") as f:
             json.dump(interesting_values, f)
+
+        gc.collect()

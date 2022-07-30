@@ -8,6 +8,7 @@ tesseract but not in the leptonica library see https://github.com/DanBloomberg/l
 
 from __future__ import annotations
 
+import functools
 import os
 import typing
 from functools import partial
@@ -33,6 +34,11 @@ import cv2.cv2 as cv2
 
 import ubii.proto as ub
 from ubii.framework.processing import ProcessingRoutine
+
+try:
+    from typing import Protocol
+except ImportError:
+    from typing_extensions import Protocol
 
 try:
     from PIL import Image
@@ -76,9 +82,11 @@ class BaseModule(ProcessingRoutine):
             context,
             mapping: typing.Dict[str, typing.Any] = None,
             eval_strings: bool = False,
+            api_variables: typing.Dict[str, typing.Any] = None,
             api_args: typing.Dict[str, typing.Any] = None,
             filter_empty_boxes: bool = True,
             ocr_confidence: int = 70,
+            result_fmt: str | typing.Callable = '{text}',
             **kwargs
     ):
         """
@@ -89,8 +97,12 @@ class BaseModule(ProcessingRoutine):
             mapping: passed to protobuf initialization
             eval_strings: evaluate protobuf method definitions
             api_args: arguments passed to TesserOCR API initialization
+            api_variables: mapping of variable names and values set in th api after initialization
             filter_empty_boxes: if the module should return bounding boxes where no text was detected
             ocr_confidence: cutoff for ocr detection, characters with lower confidence will be discarded
+            result_fmt: This format string or callable defines how the 'id' field of the result will be formatted.
+                Set it to a custom callable with kwargs to see which values will be passed to the callable
+                (normally ocr result, confidence etc.)
             **kwargs: passed to protobuf initialization
         """
         super().__init__(mapping, eval_strings, **kwargs)
@@ -119,11 +131,14 @@ class BaseModule(ProcessingRoutine):
         }
 
         self._image: ubii.proto.Image2D | None = None
+        self._cv2_image = None
         self._api: PyTessBaseAPI | None = None
         self._api_args = api_args
+        self._api_vars = api_variables
         self._filter_empty_boxes = filter_empty_boxes
         self._log_performance_in_next_frame = False
         self._performance_values = []
+        self._result_fmt = result_fmt
         self._ocr_confidence = ocr_confidence
 
     @property
@@ -141,6 +156,9 @@ class BaseModule(ProcessingRoutine):
         super().on_init(context)
         self._image = None
         self._api = PyTessBaseAPI(**(self._api_args or {}))
+
+        for name, val in (self._api_vars or {}).items():
+            self._api.SetVariable(name, val)
         log.info(f"Starting {self}")
 
     def read_image(self, image: ub.Image2D, conversion=bgr_conversions.get):
@@ -170,7 +188,8 @@ class BaseModule(ProcessingRoutine):
         gray = cv2.cvtColor(raw, grayscale_conversions.get(image.data_format))
         self.api.SetImage(Image.fromarray(gray, mode='L'))
 
-        return cv2.cvtColor(raw, conversion) if conversion else raw
+        self._cv2_image = cv2.cvtColor(raw, conversion) if conversion else raw
+        return self._cv2_image
 
     def log_performance(self, context):
         """
@@ -216,6 +235,8 @@ class BaseModule(ProcessingRoutine):
         import time
         time.sleep(1)
 
+        del self._cv2_image
+        del self._image
         self.api.__exit__(None, None, None)
         self._api = None
 
@@ -236,10 +257,9 @@ class BaseModule(ProcessingRoutine):
             recognized text in box
         """
         self.api.SetRectangle(*box)
-        ocr_result = self.api.GetUTF8Text().strip()
-        conf = self.api.MeanTextConf()
-        if conf > min_confidence and ocr_result:
-            return ocr_result
+        values = {'text': self.api.GetUTF8Text().strip(), 'conf': self.api.MeanTextConf()}
+        if values['conf'] > min_confidence and values['text']:
+            return self._result_fmt.format(**values) if isinstance(self._result_fmt, str) else self._result_fmt(**values)
 
     @staticmethod
     def object_2d_from_box(box: PixelBox) -> ub.Object2D:
@@ -461,6 +481,10 @@ class TesseractOCR_MSER(BaseModule):
             if predictions.object2D_list.elements:
                 context.outputs.predictions = predictions
 
+    def on_destroyed(self, context):
+        del self._mser
+        super().on_processing(context)
+
 
 class TesseractOCR_EAST(BaseModule):
     """
@@ -548,15 +572,17 @@ class TesseractOCR_EAST(BaseModule):
 
         sym_contained = contained | contained.T
 
-        def boxvals(index):
-            mask = sym_contained[index]
+        def boxvals(contained, index):
+            mask = contained[index]
             x = np.min(xmin[mask])
             w = np.max(xmax[mask]) - x
             y = np.min(ymin[mask])
             h = np.max(ymax[mask]) - y
             return np.asarray([x, y, w, h]).T
 
-        unique = {tuple(row) for row in map(boxvals, range(len(boxes)))}
+        make_box = functools.partial(boxvals, sym_contained)
+
+        unique = {tuple(row) for row in map(make_box, range(len(boxes)))}
         return np.vstack(tuple(unique))
 
     def on_processing(self, context):
@@ -630,3 +656,7 @@ class TesseractOCR_EAST(BaseModule):
         start_points = np.array([end_points[0] - widths, end_points[1] - heights])
         # return bounding boxes and associated confidence_val
         return np.vstack((start_points, widths, heights)).T, confidence[mask]
+
+    def on_destroyed(self, context):
+        del self._detector
+        super().on_destroyed(context)
