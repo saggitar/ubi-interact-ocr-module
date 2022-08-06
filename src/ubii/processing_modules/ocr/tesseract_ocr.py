@@ -84,7 +84,7 @@ class BaseModule(ProcessingRoutine):
             eval_strings: bool = False,
             api_variables: typing.Dict[str, typing.Any] = None,
             api_args: typing.Dict[str, typing.Any] = None,
-            filter_empty_boxes: bool = True,
+            filter_empty_boxes: bool = False,
             ocr_confidence: int = 70,
             result_fmt: str | typing.Callable = '{text}',
             **kwargs
