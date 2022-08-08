@@ -86,24 +86,61 @@ html_theme_options = {
     'page_width': '75%'
 }
 
-# autodoc_preserve_defaults = True
-# autodoc_typehints = 'description'
-# autodoc_typehints_description_target = 'documented'
-# autodoc_class_signature = 'separated'
-# autodoc_class_signature = 'mixed'
 autodoc_default_options = {
     'member-order': 'bysource',
-    'members': True,
-    'undoc-members': False,
-    'show-inheritance': True,
+    'show-inheritance': None,
+    'undoc-members': None,
 }
+modindex_common_prefix = ['ubii.']
 
+autodoc_class_signature = 'separated'
 autodoc_inherit_docstrings = False
-napoleon_include_special_with_doc = True
+autodoc_typehints = 'signature'
+autodoc_typehints_format = 'short'
+autodoc_preserve_defaults = True  # sadly still buggy when defaults are tuples of dataclass types
+
+napoleon_include_special_with_doc = False
+napoleon_include_init_with_doc = True
+napoleon_include_private_with_doc = False
+napoleon_use_rtype = False
+napoleon_use_ivar = False
+napoleon_use_param = False
 
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3', None),
     'plus': ('https://proto-plus-python.readthedocs.io/en/latest', None),
     'proto': ('https://googleapis.dev/python/protobuf/latest/', None),
-    'framework': ('https://ubii-node-python.readthedocs.io/en/develop/', None)
+    'msgs': ('https://ubii-msg-formats.readthedocs.io/en/feature-python/', None),
+    'aiohttp': ('https://docs.aiohttp.org/en/stable/', None)
 }
+
+# default_role = 'any'
+
+#  --- patch __repr__ of wrapper classes
+from ubii.proto.util import patch_wrapper_class_repr
+
+patch_wrapper_class_repr(max_len=120)
+
+# patch some errors in proto plus package
+from pkg_resources import parse_version
+
+proto_plus_version = parse_version(importlib_metadata.version('proto-plus'))
+if parse_version('1.19.9') < proto_plus_version < parse_version('1.20.2'):
+    warnings.warn(
+        f"Bug in proto.message.MessageMeta.__dir__ in your proto-plus version {proto_plus_version}."
+        f"Has been resolved in 1.20.2, see https://github.com/googleapis/proto-plus-python/issues/296"
+    )
+
+    orig_dir = proto.message.MessageMeta.__dir__
+
+
+    def patched_dir(self):
+        if not hasattr(self, '_meta'):
+            return object.__dir__(self)
+        else:
+            return orig_dir(self)
+
+
+    proto.message.MessageMeta.__dir__ = patched_dir
+
+os.environ['SPHINX_DOC_BUILDING'] = 'True'

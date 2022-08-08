@@ -19,4 +19,6 @@ ubii.processing\_modules.ocr.tesseract\_ocr module
 --------------------------------------------------
 
 .. automodule:: ubii.processing_modules.ocr.tesseract_ocr
-   :noindex:
+   :no-undoc-members:
+   :members:
+

@@ -285,6 +285,7 @@ class BaseModule(ProcessingRoutine):
     def to_image_space(dimensions: typing.Tuple[int, int], box: PixelBox) -> typing.Tuple[float, float, float, float]:
         """
         Convert absolute pixel coordinates to image space (i.e. coordinate in range [0, 1])
+
         Args:
             dimensions: image dimensions
             box: box coordinates
@@ -326,6 +327,7 @@ class BaseModule(ProcessingRoutine):
     def padded(box: PixelBox, padding: int = 0, dimensions: typing.Tuple[int, int] | None = None):
         """
         Expand box by padding in all directions
+
         Args:
             box: tuple of x, y, width, height
             padding: amount of pixels that should be padded around box.
